@@ -1,3 +1,15 @@
+# Official run
+• Package: redbull_controller
+• Command: ros2 run redbull_controller stage2
+• Extra arguments: none
+• Map it is built for: levine_obs
+• Uses LiDAR: yes, subscribes to /scan
+• Branch or tag to race: main
+• Startup time before the car moves: about 2 s
+
+
+
+
 RedBull F1TENTH Controller
 
 ROS 2 Jazzy Python controller implementing Pure Pursuit for the CIE-KFUPM F1TENTH Competition.
