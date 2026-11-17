@@ -24,8 +24,7 @@ setup(
     },
     entry_points={
     'console_scripts': [
-        'stage1 = redbull_controller.stage1_controller:main',
-        'stage2 = redbull_controller.stage2_controller:main',
+        'controller  = redbull_controller.stage2_controller:main',
     ],
     },
 )
