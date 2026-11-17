@@ -539,7 +539,7 @@ class Stage2DisparityController(Node):
         super().__init__('redbull_stage2_controller')
         defaults = {
             # Speed profile along the race line
-            'max_speed': 5.2,
+            'max_speed': 5.8,
             'tight_speed': 0.9,          # speed where clearance is smallest (cluster, corner)
             'tight_clearance': 0.07,     # clearance (m) treated as "tightest"
             'open_clearance': 0.30,      # clearance (m) above which max_speed is allowed
@@ -586,8 +586,8 @@ class Stage2DisparityController(Node):
 
             # Startup grace period (the out-lap is not timed, so take it gently)
             'startup_hold': 1.0,         # s of steady scan+odom before the car moves
-            'outlap_speed': 0.6,         # speed cap until the cluster has been passed once
-            'outlap_end_x': 2.8,         # first time x passes this on the bottom straight -> race pace
+            'outlap_speed': 4.0,         # speed cap until the cluster has been passed once
+            'outlap_end_x': 1.0,         # first time x passes this on the bottom straight -> race pace
             'guard_period': 0.02,        # s between LiDAR guard checks (50 Hz)
 
             'sensor_timeout': 0.5,
