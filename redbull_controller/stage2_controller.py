@@ -520,6 +520,23 @@ RACE_LINE = """
 -0.0886,-0.4636,0.1930,0.0151
 """
 
+#!/usr/bin/env python3
+import math
+import time
+import csv
+from pathlib import Path
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
+from rclpy.clock import Clock, ClockType
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from ackermann_msgs.msg import AckermannDriveStamped
+
+# (Your race line points string or loader goes here)
+
 LIDAR_X = 0.275             # LiDAR ahead of rear axle (sim.yaml lidar_base_link_to_lidar_tf)
 BODY_REAR = -0.1249         # collision box spans [-0.125, 0.455] m about the rear axle (centred on wheelbase)
 BODY_FRONT = 0.4551
@@ -556,7 +573,7 @@ class Stage2DisparityController(Node):
 
             'latency_comp': 0.12,        # s; steering servo lag compensation
             'ff_gain': 1.0,              # corner-cutting compensation (0 = plain pure pursuit)
-            'ff_preview': 0.0,           # where along the look-ahead to sample curvature (0..1)        # s; steering servo lag compensation
+            'ff_preview': 0.0,           # where along the look-ahead to sample curvature (0..1)
             'steer_alpha': 0.85,         # steering smoothing (1.0 = none)
             'min_lookahead': 0.60,
             'max_lookahead': 1.60,
@@ -636,14 +653,14 @@ class Stage2DisparityController(Node):
         self.last_cmd_speed = 0.0
 
         self.drive_pub = self.create_publisher(AckermannDriveStamped, '/drive', 10)
-        self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, '/scan', self.on_scan, rclpy.qos.qos_profile_sensor_data)
         # depth 1: always act on the newest pose, never on a backlog of old ones
         self.create_subscription(Odometry, '/ego_racecar/odom', self.on_odom, 1)
         self.odom_count = 0
         self.create_timer(2.0, self.health_check, clock=Clock(clock_type=ClockType.STEADY_TIME))
 
         self.create_timer(0.1, self.watchdog, clock=Clock(clock_type=ClockType.STEADY_TIME))
-        self.get_logger().info(f'Stage 2 Controller v9.1 (fast, self-checks) ready: {len(self.waypoints)} race-line points, max_speed={self.max_speed}')
+        self.get_logger().info(f'Stage 2 Controller v9.1 (ROS time fixed) ready: {len(self.waypoints)} race-line points, max_speed={self.max_speed}')
 
     # ------------------------------------------------------------------ race line
     def load_race_line(self):
@@ -675,7 +692,6 @@ class Stage2DisparityController(Node):
 
     def build_speed_profile(self):
         n = len(self.wp)
-        # curvature from a wider stencil (smooths DP steps)
         k = 4
         a = np.roll(self.wp, k, axis=0)
         b = self.wp
@@ -694,13 +710,11 @@ class Stage2DisparityController(Node):
         frac = np.clip((self.wp_clear - self.tight_clearance) /
                        max(1e-3, self.open_clearance - self.tight_clearance), 0.0, 1.0)
         v_clear = self.tight_speed + frac * (self.max_speed - self.tight_speed)
-        # the car must already be slow when its footprint reaches a tight spot:
-        # take the min over a window covering the car length ahead and behind
         win = 6
         v_clear = np.min(np.stack([np.roll(v_clear, -j) for j in range(-win, win + 1)]), axis=0)
 
         v = np.minimum(np.minimum(v_curve, v_clear), self.max_speed)
-        for _ in range(2):   # braking (backward) and acceleration (forward) passes, loop closed
+        for _ in range(2):
             for i in range(2 * n, -1, -1):
                 j = i % n
                 v[j] = min(v[j], math.sqrt(v[(j + 1) % n] ** 2 + 2 * self.brake_decel * self.wp_ds[j]))
@@ -710,12 +724,6 @@ class Stage2DisparityController(Node):
         self.wp_speed = v
 
     # ------------------------------------------------------------------ I/O
-    def on_lap(self, msg):
-        self.completed_laps = int(msg.data)
-
-    def on_collision(self, msg):
-        self.collisions = int(msg.data)
-
     def publish(self, steering, speed):
         msg = AckermannDriveStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -739,34 +747,29 @@ class Stage2DisparityController(Node):
 
     def on_scan(self, msg):
         self.scan = msg
-        self.scan_time = time.monotonic()
+        self.scan_time = self.get_clock().now()
 
     def fresh(self):
-        now = time.monotonic()
-        return (
-            self.scan is not None
-            and self.scan_time is not None
-            and self.odom_time is not None
-            and (now - self.scan_time) <= self.sensor_timeout
-            and (now - self.odom_time) <= self.sensor_timeout
-        )
+        if self.scan is None or self.scan_time is None or self.odom_time is None:
+            return False
+        now = self.get_clock().now()
+        scan_age = (now - self.scan_time).nanoseconds / 1e9
+        odom_age = (now - self.odom_time).nanoseconds / 1e9
+        return scan_age <= self.sensor_timeout and odom_age <= self.sensor_timeout
 
     def health_check(self):
-        """Log the setup problems that make runs inconsistent."""
         try:
             pubs = self.count_publishers('/drive')
         except Exception:
             pubs = 1
         if pubs > 1:
             self.get_logger().error(
-                f'{pubs} nodes are publishing /drive - another controller or teleop is running. '
-                'Stop it (ros2 node list) or the car gets mixed commands.')
+                f'{pubs} nodes are publishing /drive - another controller or teleop is running.')
         rate = self.odom_count / 2.0
         self.odom_count = 0
         if self.odom_time is not None and 0.0 < rate < 150.0:
             self.get_logger().warn(
-                f'odom arriving at {rate:.0f} Hz (expected ~250): the simulator is running slow. '
-                'Close RViz and other heavy programs.')
+                f'odom arriving at {rate:.0f} Hz (expected ~250): the simulator is running slow.')
 
     def watchdog(self):
         if not self.fresh():
@@ -787,7 +790,6 @@ class Stage2DisparityController(Node):
         return idx
 
     def point_at(self, s_arc):
-        """Interpolated (x, y, yaw, curvature) at arc length s along the race line."""
         n = len(self.wp)
         s_arc = s_arc % self.track_len
         i = int(np.searchsorted(self.wp_s, s_arc, side='right') - 1) % n
@@ -809,13 +811,6 @@ class Stage2DisparityController(Node):
         return math.atan(self.wheelbase * 2.0 * local_y / d2), local_x, local_y
 
     def pure_pursuit(self, x, y, yaw, lookahead, v=0.0):
-        """Pure pursuit with interpolated look-ahead point and corner-cutting compensation.
-
-        Plain pure pursuit cuts the inside of every curve (it aims at a chord, not the arc).
-        We evaluate what pure pursuit would command if the car were exactly on the line
-        (`ideal`) and compare it with the steering the line's curvature really needs (`ff`);
-        the difference is pure pursuit's built-in cutting error and is added back.
-        Returns (steering, target_idx, local_x, local_y, nearest_idx)."""
         n = len(self.wp)
         near = self.nearest_waypoint(x, y)
         best = None
@@ -859,8 +854,6 @@ class Stage2DisparityController(Node):
         return r, valid
 
     def guard_race_line(self, x, y, yaw, near_idx, v, r, valid):
-        """Distance along the race line to the first footprint pose that contains LiDAR points
-        (inf if the next `horizon` metres are clear)."""
         horizon = max(2.0, 1.2 * v + v * v / (2.0 * self.brake_decel) + 0.8)
         sel = valid & (r < horizon + 1.5)
         if not np.any(sel):
@@ -868,7 +861,7 @@ class Stage2DisparityController(Node):
         lx = LIDAR_X + r[sel] * self._cos[sel]
         ly = r[sel] * self._sin[sel]
         c, s = math.cos(yaw), math.sin(yaw)
-        px = x + c * lx - s * ly          # LiDAR points in the map frame
+        px = x + c * lx - s * ly
         py = y + s * lx + c * ly
 
         n = len(self.wp)
@@ -882,7 +875,7 @@ class Stage2DisparityController(Node):
         idxs = np.array([k for k, _ in steps])
         dists = np.array([d for _, d in steps])
 
-        ahead = lx > BODY_FRONT + 0.05            # ignore what is beside the car right now
+        ahead = lx > BODY_FRONT + 0.05
         if not np.any(ahead):
             return math.inf
         px, py = px[ahead], py[ahead]
@@ -902,8 +895,6 @@ class Stage2DisparityController(Node):
         return float(dists[hit[0]])
 
     def disparity_extender_steering(self, r, valid, preferred_angle):
-        """Follow-the-gap: extend disparities by the car half-width, pick the deepest opening
-        closest to the race-line direction, steer toward it with pure-pursuit geometry."""
         fov = math.radians(self.gap_fov_deg)
         sel = np.abs(self._angles) <= fov
         ang = self._angles[sel]
@@ -926,7 +917,6 @@ class Stage2DisparityController(Node):
 
         smoothed = np.convolve(extended, np.ones(7) / 7.0, mode='same')
         score = np.minimum(smoothed, 3.0) - self.heading_weight * np.abs(ang - preferred_angle)
-        # never aim at a direction that is blocked close ahead, however well it lines up
         deep = extended >= self.min_gap_depth
         if np.any(deep):
             score = np.where(deep, score, -np.inf)
@@ -941,8 +931,6 @@ class Stage2DisparityController(Node):
         return clamp(steer, -self.max_steering, self.max_steering), float(extended[best])
 
     def arc_free_distance(self, steer, r, valid, max_dist=1.5, margin=0.03):
-        """Distance the car can drive on a constant-steering arc before its footprint
-        touches a LiDAR point (car frame, rear axle origin)."""
         m = valid & (r < max_dist + 1.0)
         if not np.any(m):
             return max_dist
@@ -967,7 +955,6 @@ class Stage2DisparityController(Node):
         return float(s[idx[0]] - 0.05) if len(idx) else max_dist
 
     def bumper_distance(self, r, valid):
-        """Free distance in front of the front bumper, inside the car's width."""
         lx = LIDAR_X + r * self._cos
         ly = r * self._sin
         m = valid & (lx > BODY_FRONT - 0.05) & (np.abs(ly) < BODY_HALF_W + 0.03)
@@ -976,23 +963,23 @@ class Stage2DisparityController(Node):
         return float(np.min(lx[m])) - BODY_FRONT
 
     # ------------------------------------------------------------------ recovery
-    def update_stuck(self, vx, bumper, r, valid, now):
+    def update_stuck(self, vx, bumper, r, valid, now_sec):
         if self.reverse_until is not None:
-            if now < self.reverse_until:
+            if now_sec < self.reverse_until:
                 return True
             self.reverse_until = None
             self.stuck_since = None
             self.last_steering = 0.0
         if self.last_cmd_speed > 0.2 and abs(vx) < 0.05:
             if self.stuck_since is None:
-                self.stuck_since = now
-            elif now - self.stuck_since > self.stuck_time and bumper < 0.3:
+                self.stuck_since = now_sec
+            elif now_sec - self.stuck_since > self.stuck_time and bumper < 0.3:
                 left = valid & (self._angles > 0.0) & (self._angles < math.radians(90))
                 right = valid & (self._angles < 0.0) & (self._angles > math.radians(-90))
                 l_min = float(np.min(r[left])) if np.any(left) else 10.0
                 r_min = float(np.min(r[right])) if np.any(right) else 10.0
                 self.reverse_steer = self.max_steering if l_min < r_min else -self.max_steering
-                self.reverse_until = now + self.reverse_time
+                self.reverse_until = now_sec + self.reverse_time
                 self.get_logger().warn('Stuck - reversing')
                 return True
         else:
@@ -1001,21 +988,25 @@ class Stage2DisparityController(Node):
 
     # ------------------------------------------------------------------ main loop
     def on_odom(self, msg):
-        self.odom_time = time.monotonic()
+        current_time = self.get_clock().now()
+        self.odom_time = current_time
         self.odom_count += 1
+        
         if not self.fresh():
             self.sensors_ok_since = None
             self.stop()
             return
-        now = self.odom_time
-        if now - self.last_control < self.control_period - 1e-4:
+            
+        now_sec = current_time.nanoseconds / 1e9
+        if now_sec - self.last_control < self.control_period - 1e-4:
             return
-        self.last_control = now
+        self.last_control = now_sec
 
         # Startup grace: wait for steady sensors before moving
         if self.sensors_ok_since is None:
-            self.sensors_ok_since = now
-        if now - self.sensors_ok_since < self.startup_hold:
+            self.sensors_ok_since = current_time
+        startup_elapsed = (current_time - self.sensors_ok_since).nanoseconds / 1e9
+        if startup_elapsed < self.startup_hold:
             self.stop()
             return
 
@@ -1031,7 +1022,7 @@ class Stage2DisparityController(Node):
         r, valid = self.scan_arrays(self.scan)
         bumper = self.bumper_distance(r, valid)
 
-        if self.update_stuck(vx, bumper, r, valid, now):
+        if self.update_stuck(vx, bumper, r, valid, now_sec):
             self.blocked_count = self.clear_count = 0
             self.last_cmd_speed = 0.0
             self.publish(self.reverse_steer, self.reverse_speed)
@@ -1039,7 +1030,6 @@ class Stage2DisparityController(Node):
 
         lookahead = clamp(self.min_lookahead + self.lookahead_gain * v,
                           self.min_lookahead, self.max_lookahead)
-        # compensate steering-actuator lag: run pure pursuit from the pose ~latency s ahead
         tau = self.latency_comp
         yaw_rate = v * math.tan(self.last_steering) / self.wheelbase
         px = pos.x + v * tau * math.cos(yaw + 0.5 * yaw_rate * tau)
@@ -1048,9 +1038,10 @@ class Stage2DisparityController(Node):
         pp_steer, target_idx, lx, ly, near_idx = self.pure_pursuit(px, py, pyaw, lookahead, v)
 
         # LiDAR guard on the race line (once per new scan)
-        if self.scan_time != self._guard_scan_time and now - self._guard_time >= self.guard_period:
+        guard_time_sec = self._guard_time.nanoseconds / 1e9 if isinstance(self._guard_time, rclpy.time.Time) else self._guard_time
+        if self.scan_time != self._guard_scan_time and (now_sec - guard_time_sec) >= self.guard_period:
             self._guard_scan_time = self.scan_time
-            self._guard_time = now
+            self._guard_time = current_time
             self.blocked_s = self.guard_race_line(pos.x, pos.y, yaw, near_idx, v, r, valid)
             if self.blocked_s < math.inf:
                 self.blocked_count += 1
@@ -1061,38 +1052,39 @@ class Stage2DisparityController(Node):
             if (not self.in_obstacle_zone and self.blocked_count >= self.guard_cycles
                     and (v < self.gap_engage_speed or self.blocked_s < 0.5)):
                 self.in_obstacle_zone = True
-                self.gap_since = now
+                self.gap_since = current_time
                 self.get_logger().warn('Race line blocked - follow the gap')
             if self.blocked_s < math.inf:
                 self.clear_since = None
             elif self.clear_since is None:
-                self.clear_since = now
+                self.clear_since = current_time
+                
+            clear_sec = (current_time - self.clear_since).nanoseconds / 1e9 if self.clear_since else 0.0
             if (self.in_obstacle_zone and self.clear_since is not None
-                    and now - self.clear_since > self.clear_time
+                    and clear_sec > self.clear_time
                     and self.arc_free_distance(pp_steer, r, valid) >= self.rejoin_free):
                 self.in_obstacle_zone = False
                 self.rejoining = True
                 self.get_logger().info('Race line clear - pure pursuit')
 
         if self.in_obstacle_zone:
+            gap_since_sec = self.gap_since.nanoseconds / 1e9 if isinstance(self.gap_since, rclpy.time.Time) else self.gap_since
             if v > 0.05:
-                self.gap_since = now
-            elif now - self.gap_since > self.gap_stuck_time:
-                # stalled in front of something: back out, then look for a gap again
+                self.gap_since = current_time
+            elif now_sec - gap_since_sec > self.gap_stuck_time:
                 left = valid & (self._angles > 0.0) & (self._angles < math.radians(90))
                 right = valid & (self._angles < 0.0) & (self._angles > math.radians(-90))
                 l_min = float(np.min(r[left])) if np.any(left) else 10.0
                 r_min = float(np.min(r[right])) if np.any(right) else 10.0
                 self.reverse_steer = self.max_steering if l_min < r_min else -self.max_steering
-                self.reverse_until = now + self.reverse_time
-                self.gap_since = now + self.reverse_time
+                self.reverse_until = now_sec + self.reverse_time
+                self.gap_since = current_time + rclpy.duration.Duration(seconds=self.reverse_time)
                 self.get_logger().warn('Follow the gap stalled - backing out')
                 self.publish(self.reverse_steer, self.reverse_speed)
                 return
 
         if not self.in_obstacle_zone:
             steering = pp_steer
-            # look a little ahead in the speed profile so braking starts early enough
             lead = int(round(self.speed_lead / max(1e-3, float(np.mean(self.wp_ds)))))
             target_speed = float(np.min(self.wp_speed[(near_idx + lead + np.arange(0, 4)) % len(self.wp)]))
             if self.rejoining:
@@ -1104,7 +1096,6 @@ class Stage2DisparityController(Node):
                     free = self.arc_free_distance(pp_steer, r, valid)
                     target_speed = min(target_speed,
                                        math.sqrt(2.0 * self.brake_decel * max(0.0, free - 0.05)))
-            # never drive faster than we can stop before a LiDAR return on our line
             if self.blocked_s < math.inf:
                 stop_room = max(0.0, self.blocked_s - self.stop_buffer)
                 target_speed = min(target_speed, math.sqrt(2.0 * self.brake_decel * stop_room))
@@ -1112,22 +1103,20 @@ class Stage2DisparityController(Node):
             steering, gap_dist = self.disparity_extender_steering(r, valid, math.atan2(ly, lx))
             free = self.arc_free_distance(steering, r, valid)
             if free < 0.15 and bumper < 0.35:
-                # too close to turn away: committed back-up at full lock, nose swinging to the
-                # more open side, then drive out toward that side
                 left = valid & (self._angles > 0.2) & (self._angles < 1.6)
                 right = valid & (self._angles < -0.2) & (self._angles > -1.6)
                 l_free = float(np.median(r[left])) if np.any(left) else 0.0
                 r_free = float(np.median(r[right])) if np.any(right) else 0.0
                 side = 1.0 if l_free >= r_free else -1.0
                 self.escape_side = side
-                self.escape_until = now + self.reverse_time + 1.0
+                self.escape_until = now_sec + self.reverse_time + 1.0
                 self.reverse_steer = -side * self.max_steering
-                self.reverse_until = now + self.reverse_time
-                self.gap_since = now + self.reverse_time
+                self.reverse_until = now_sec + self.reverse_time
+                self.gap_since = current_time + rclpy.duration.Duration(seconds=self.reverse_time)
                 self.last_cmd_speed = 0.0
                 self.publish(self.reverse_steer, self.reverse_speed)
                 return
-            if now < self.escape_until and free >= 0.15:
+            if now_sec < self.escape_until and free >= 0.15:
                 steering = self.escape_side * self.max_steering
             target_speed = self.obstacle_speed * (1.0 - 0.4 * abs(steering) / self.max_steering)
             if gap_dist < 1.0:
@@ -1136,7 +1125,6 @@ class Stage2DisparityController(Node):
                                math.sqrt(2.0 * self.brake_decel * max(0.0, free - 0.05)))
             target_speed = max(target_speed, 0.25) if free > 0.15 else target_speed
 
-        # Out-lap: race pace only after the first pass through the cluster
         if self.outlap:
             if pos.x > self.outlap_end_x and abs(pos.y) < 1.5:
                 self.outlap = False
